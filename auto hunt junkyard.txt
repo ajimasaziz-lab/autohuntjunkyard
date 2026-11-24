@@ -1,0 +1,1843 @@
+--// Monster Hunt Auto Farm v14 + GUI kecil
+--// v14: - Skill E DIPRIORITASKAN saat menyerang (fight, dodge, flee semuanya lewat logika yang sama).
+--//        Selama menunggu jeda E (dan saat MP minimum) bot menyerang pakai klik kiri, tidak diam.
+--//      - Tombol "1" hanya ditekan saat START dan setelah respawn (flag needSkill1,
+--//        juga di-set di CharacterAdded supaya respawn cepat tidak terlewat).
+--// v13: - Tombol "Set Titik 1" & "Set Titik 2" (posisi karakter saat ini) + tombol Reset 1 / Reset 2.
+--//      - Monster hanya di-scan dalam radius 100 stud (bisa diubah) dari titik 1 / titik 2.
+--//        Kalau kedua titik kosong -> scan semua area seperti sebelumnya.
+--//      - Monster target ditandai HIJAU, monster yang dihindari ditandai KUNING.
+--//      - Scan ulang tiap 10 detik (bisa diubah di GUI), juga saat bot belum START.
+--//      - Tombol START/STOP tetap tampil ketika GUI di-minimize.
+--// v12: skill 3 dihapus, hanya skill 1 + E.
+--//      E berhenti kalau MP < 25, lanjut lagi setelah MP mencapai 100.
+--//      Selama MP pulih, di dekat musuh hanya klik kiri.
+local Players = game:GetService("Players")
+local VIM = game:GetService("VirtualInputManager")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local lp = Players.LocalPlayer
+
+pcall(function()
+    for _, p in ipairs({ (gethui and gethui()) or game:GetService("CoreGui"), lp:WaitForChild("PlayerGui") }) do
+        local old = p:FindFirstChild("PatchHoundBot")
+        if old then old:Destroy() end
+    end
+end)
+pcall(function() RunService:UnbindFromRenderStep("PHCamLock") end)
+pcall(function()
+    local cam = workspace.CurrentCamera
+    local old = cam and cam:FindFirstChild("PHWalls")
+    if old then old:Destroy() end
+end)
+
+----------------------------------------------------------------
+-- STATE
+----------------------------------------------------------------
+local SAFE_POS = Vector3.new(-166, 45, -349) -- tempat pulih saat HP di bawah batas
+local FARM_POS = Vector3.new(50, 52, -382)   -- titik mulai farming (setelah pulih / respawn)
+
+local TARGETS = {
+    { name = "Patch Hound",        on = true },
+    { name = "Cog Crab",           on = false },
+    { name = "Cup Snail",          on = false },
+    { name = "Spore Deer",         on = false },
+    { name = "Scarecrow Goblin",   on = false },
+}
+local function targetKeys()
+    local t = {}
+    for _, x in ipairs(TARGETS) do
+        if x.on then table.insert(t, x.name:lower()) end
+    end
+    return t
+end
+
+local AVOID = { "critter goblin", "kettle beetle" }
+local WASD = { Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D }
+local running, session, damaged, recovering = false, 0, false, false
+local held = {}
+local boxes = {}
+local statusLabel, hpLabel, mpLabel, scanLabel
+local gui
+local hlFolder              -- folder tempat Highlight (diisi saat GUI dibuat)
+local hlMap = {}            -- [model] = Highlight
+local POINT_DEFAULTS = { Vector3.new(82, 50, -404), Vector3.new(171, 50, -615) } -- koordinat dasar titik 1 & 2
+local points = { POINT_DEFAULTS[1], POINT_DEFAULTS[2] } -- titik scan 1 & 2 (Vector3 atau nil)
+local wallFolder            -- folder dinding merah (client-side, di dalam Camera)
+local wallsOn = true        -- tombol ON/OFF dinding
+local wallSig = ""          -- penanda perubahan (titik / radius / ON-OFF) untuk gambar ulang
+local lockMob = nil
+local camFocus = nil
+local mode = 1 -- 1 = VIM, 2 = KEYPRESS, 3 = MOVETO
+local MODE_NAMES = { "VIM", "KEYPRESS", "MOVETO" }
+local hpSrc = 1 -- 1 = AUTO, 2 = HUMANOID, 3 = GUI, 4 = ATTR
+local SRC_NAMES = { "AUTO", "HUMANOID", "GUI", "ATTR" }
+local curHp, curMax, lastHp = nil, nil, nil
+local curMp, curMpMax = nil, nil
+local mpRest = false      -- true = MP sedang dipulihkan (jangan pakai E)
+local needSkill1 = true   -- true = tombol "1" perlu ditekan (HANYA start / setelah respawn)
+local lastE = 0           -- waktu terakhir tekan E
+local detour = { ang = 0, untilT = 0 }
+local lastPos, lastPosT = nil, 0
+
+local COLOR_TARGET = Color3.fromRGB(0, 255, 0)
+local COLOR_AVOID = Color3.fromRGB(255, 255, 0)
+
+local DEFAULTS = {
+    eint = 0.5,    -- jeda antar tekan E (detik); isi sesuai cooldown skill E jika perlu
+    mplow = 25,    -- MP di bawah ini -> berhenti pakai E
+    mpok = 100,    -- MP mencapai ini -> mulai pakai E lagi
+    cint = 0.1,
+    stop = 8, range = 500, dodge = 1.5,
+    hplow = 400, hpok = 600, safe = 80, avoid = 35,
+    wall = 5, turn = 0.8,
+    gapclk = 1,   -- 1 = klik kiri diizinkan saat dekat monster
+    dodgeclk = 1, -- 1 = serang saat menghindar (kena damage)
+    fleeatk = 1,  -- 1 = serang (skill E / klik) sambil menghindar monster
+    scanr = 120,  -- radius scan dari titik 1 / titik 2 (stud)
+    scanint = 10, -- scan ulang tiap N detik
+}
+
+local VK = {
+    [Enum.KeyCode.W] = 0x57, [Enum.KeyCode.A] = 0x41,
+    [Enum.KeyCode.S] = 0x53, [Enum.KeyCode.D] = 0x44,
+    [Enum.KeyCode.E] = 0x45, [Enum.KeyCode.Q] = 0x51, [Enum.KeyCode.One] = 0x31,
+    [Enum.KeyCode.Three] = 0x33, [Enum.KeyCode.Space] = 0x20,
+}
+
+local function num(k)
+    local b = boxes[k]
+    local v = b and tonumber(b.Text)
+    return (v and v >= 0) and v or DEFAULTS[k]
+end
+
+local function setStatus(t)
+    if statusLabel then statusLabel.Text = "Status: " .. t end
+end
+
+----------------------------------------------------------------
+-- BACA HP & MP (bar kiri atas / atribut / Humanoid)
+----------------------------------------------------------------
+local guiLabel, lastGuiScan = nil, 0
+local mpGuiLabel, lastMpScan = nil, 0
+
+local function parseHP(text)
+    text = text:gsub("<[^>]+>", ""):gsub(",", "")
+    local a, b = text:match("(%d+%.?%d*)%s*/%s*(%d+%.?%d*)")
+    if a then return tonumber(a), tonumber(b) end
+end
+
+local function readGui()
+    if guiLabel and guiLabel.Parent then
+        local a, b = parseHP(guiLabel.Text)
+        if a then return a, b end
+    end
+    guiLabel = nil
+    if os.clock() - lastGuiScan < 2 then return end
+    lastGuiScan = os.clock()
+
+    local pg = lp:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local best, bestScore
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible and o.Text ~= "" then
+            local pos = o.AbsolutePosition
+            if pos.X < 500 and pos.Y < 300 then
+                local a, b = parseHP(o.Text)
+                if a and b and b > 0 and a <= b then
+                    local score = pos.X + pos.Y
+                    local n = (o.Name .. (o.Parent and o.Parent.Name or "")):lower()
+                    if n:find("health") or n:find("hp") then score -= 1000 end
+                    if not bestScore or score < bestScore then best, bestScore = o, score end
+                end
+            end
+        end
+    end
+    if best then
+        guiLabel = best
+        return parseHP(best.Text)
+    end
+end
+
+-- baca MP dari GUI: cari label "angka/angka" bernama mp/mana/energy,
+-- kalau tidak ada ambil label bar berikutnya setelah HP (di kiri atas)
+local function readMpGui()
+    if mpGuiLabel and mpGuiLabel.Parent then
+        local a, b = parseHP(mpGuiLabel.Text)
+        if a then return a, b end
+    end
+    mpGuiLabel = nil
+    if os.clock() - lastMpScan < 2 then return end
+    lastMpScan = os.clock()
+
+    local pg = lp:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local best, bestScore
+    for _, o in ipairs(pg:GetDescendants()) do
+        if o ~= guiLabel and (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible and o.Text ~= "" then
+            local pos = o.AbsolutePosition
+            if pos.X < 500 and pos.Y < 300 then
+                local a, b = parseHP(o.Text)
+                if a and b and b > 0 and a <= b then
+                    local n = (o.Name .. (o.Parent and o.Parent.Name or "")):lower()
+                    if not (n:find("health") or n:find("hp")) then
+                        local score = pos.X + pos.Y
+                        if n:find("mp") or n:find("mana") or n:find("energy") then score -= 1000 end
+                        if not bestScore or score < bestScore then best, bestScore = o, score end
+                    end
+                end
+            end
+        end
+    end
+    if best then
+        mpGuiLabel = best
+        return parseHP(best.Text)
+    end
+end
+
+local HP_NAMES = { "Health", "HP", "CurrentHealth", "hp", "health", "Hp" }
+local MAX_NAMES = { "MaxHealth", "MaxHP", "maxHealth", "MaxHp", "maxHp", "maxhp" }
+local MP_NAMES = { "Mana", "MP", "CurrentMana", "Energy", "mana", "mp", "energy", "Mp" }
+local MPMAX_NAMES = { "MaxMana", "MaxMP", "maxMana", "MaxEnergy", "maxMp", "maxmp", "maxEnergy", "MaxMp" }
+
+local function readAttr(names, maxNames)
+    local c = lp.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    local holders = { c, hum, lp, lp:FindFirstChild("leaderstats"), lp:FindFirstChild("Data") }
+    for _, h in ipairs(holders) do
+        if h then
+            for _, n in ipairs(names) do
+                local v = h:GetAttribute(n)
+                if type(v) ~= "number" then
+                    local ch = h:FindFirstChild(n)
+                    if ch and (ch:IsA("NumberValue") or ch:IsA("IntValue")) then v = ch.Value end
+                end
+                if type(v) == "number" then
+                    local mx
+                    for _, mn in ipairs(maxNames) do
+                        local m = h:GetAttribute(mn)
+                        if type(m) ~= "number" then
+                            local ch = h:FindFirstChild(mn)
+                            if ch and (ch:IsA("NumberValue") or ch:IsA("IntValue")) then m = ch.Value end
+                        end
+                        if type(m) == "number" then mx = m break end
+                    end
+                    return v, mx
+                end
+            end
+        end
+    end
+end
+
+local function readHum()
+    local c = lp.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h then return h.Health, h.MaxHealth end
+end
+
+local function readHP()
+    if hpSrc == 2 then return readHum() end
+    if hpSrc == 3 then return readGui() end
+    if hpSrc == 4 then return readAttr(HP_NAMES, MAX_NAMES) end
+    local a, b = readGui()
+    if a then return a, b end
+    a, b = readAttr(HP_NAMES, MAX_NAMES)
+    if a then return a, b end
+    return readHum()
+end
+
+local function readMP()
+    local a, b = readMpGui()
+    if a then return a, b end
+    return readAttr(MP_NAMES, MPMAX_NAMES)
+end
+
+local function lowHp()
+    local low = num("hplow")
+    return curHp ~= nil and curHp < low and (curMax == nil or curMax > low)
+end
+
+local function okTarget()
+    local t = math.max(num("hpok"), num("hplow") + 1)
+    if curMax and curMax < t then t = curMax end
+    return t
+end
+
+task.spawn(function()
+    while true do
+        if gui and not gui.Parent then break end
+        local hp, mx = readHP()
+        if hp then
+            if lastHp and hp < lastHp then damaged = true end
+            lastHp, curHp, curMax = hp, hp, mx
+            if running and lowHp() then recovering = true end
+            if hpLabel then
+                local txt = string.format("HP %d%s [%s]", hp, mx and ("/" .. math.floor(mx)) or "", SRC_NAMES[hpSrc])
+                if mx and mx <= num("hplow") then txt = txt .. " (MaxHP<=batas!)" end
+                hpLabel.Text = txt
+            end
+        else
+            curHp, curMax = nil, nil
+            if hpLabel then hpLabel.Text = "HP tidak terbaca [" .. SRC_NAMES[hpSrc] .. "]" end
+        end
+
+        -- MP: berhenti pakai E di bawah "MP stop", lanjut lagi saat mencapai "MP lanjut"
+        local mp, mmx = readMP()
+        if mp then
+            curMp, curMpMax = mp, mmx
+            local low = num("mplow")
+            local okv = math.max(num("mpok"), low + 1)
+            if mmx and mmx < okv then okv = mmx end
+            if mp < low then
+                mpRest = true
+            elseif mpRest and mp >= okv - 0.5 then
+                mpRest = false
+            end
+            if mpLabel then
+                mpLabel.Text = string.format("MP %d%s%s", mp, mmx and ("/" .. math.floor(mmx)) or "", mpRest and "  (pulih, tanpa E)" or "")
+            end
+        else
+            curMp, curMpMax = nil, nil
+            mpRest = false
+            if mpLabel then mpLabel.Text = "MP tidak terbaca" end
+        end
+        task.wait(0.1)
+    end
+end)
+
+----------------------------------------------------------------
+-- INPUT
+----------------------------------------------------------------
+local function press(key, state)
+    if mode == 2 and keypress and keyrelease then
+        if state then keypress(VK[key]) else keyrelease(VK[key]) end
+    else
+        VIM:SendKeyEvent(state, key, false, game)
+    end
+end
+
+local function tap(key)
+    press(key, true)
+    task.wait(0.05)
+    press(key, false)
+end
+
+local function screenCenter()
+    local cam = workspace.CurrentCamera
+    local v = cam and cam.ViewportSize or Vector2.new(960, 540)
+    return v.X / 2, v.Y / 2
+end
+
+local function click()
+    local x, y = screenCenter()
+    if mode == 2 and mouse1click then
+        if mousemoveabs then
+            pcall(mousemoveabs, x, y)
+        else
+            VIM:SendMouseMoveEvent(x, y, game)
+        end
+        mouse1click()
+    else
+        VIM:SendMouseMoveEvent(x, y, game)
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end
+end
+
+local function setKey(key, state)
+    if held[key] == state then return end
+    held[key] = state
+    press(key, state)
+end
+
+local function releaseAll()
+    camFocus = nil
+    for _, k in ipairs({ Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Space }) do
+        if held[k] then setKey(k, false) end
+    end
+    local c = lp.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    if hum and mode == 3 then hum:Move(Vector3.zero) end
+    lastPos = nil
+    detour.untilT = 0
+end
+
+local function resetKeyState()
+    for _, k in ipairs(WASD) do
+        press(k, false)
+        held[k] = nil
+    end
+end
+
+----------------------------------------------------------------
+-- KARAKTER
+----------------------------------------------------------------
+local function getChar()
+    local c = lp.Character
+    if not c then return end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    local r = c:FindFirstChild("HumanoidRootPart")
+    if h and r and h.Health > 0 then return c, h, r end
+end
+
+----------------------------------------------------------------
+-- DETEKSI MONSTER (area scan = radius dari titik 1 / titik 2)
+----------------------------------------------------------------
+local function mobPart(m)
+    return m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function nameMatches(m, list)
+    local n = m.Name:lower()
+    local h = m:FindFirstChildOfClass("Humanoid")
+    local dn = h and h.DisplayName:lower() or ""
+    for _, key in ipairs(list) do
+        if n:find(key, 1, true) or dn:find(key, 1, true) then return true end
+    end
+    return false
+end
+
+-- true jika pos berada dalam radius scan dari titik 1 atau titik 2.
+-- Kalau kedua titik belum diset -> semua area dianggap valid.
+local function inArea(pos, extra)
+    extra = extra or 0
+    local any = false
+    local r = num("scanr") + extra
+    for i = 1, 2 do
+        local p = points[i]
+        if p then
+            any = true
+            if (pos - p).Magnitude <= r then return true end
+        end
+    end
+    return not any
+end
+
+----------------------------------------------------------------
+-- DINDING MERAH di tepi radius scan (visual saja: tidak bisa ditabrak,
+-- tidak ikut raycast, hanya terlihat di layar kita)
+----------------------------------------------------------------
+local WALL_HEIGHT = 80
+local WALL_COLOR = Color3.fromRGB(255, 30, 30)
+local WALL_TRANSPARENCY = 0.88 -- makin dekat 1 makin transparan
+local CENTER_SIZE = 5          -- diameter bola merah titik tengah (stud)
+
+local function wallSignature()
+    return string.format("%s|%s|%s|%s", tostring(num("scanr")), tostring(points[1]), tostring(points[2]), tostring(wallsOn))
+end
+
+local function clearWalls()
+    if wallFolder then
+        wallFolder:Destroy()
+        wallFolder = nil
+    end
+end
+
+local function drawWalls()
+    clearWalls()
+    wallSig = wallSignature()
+    if not wallsOn then return end
+    local cam = workspace.CurrentCamera
+    local R = num("scanr")
+    if not cam or R <= 0 or not (points[1] or points[2]) then return end
+
+    wallFolder = Instance.new("Folder")
+    wallFolder.Name = "PHWalls"
+    wallFolder.Parent = cam
+
+    local n = math.clamp(math.floor(R * 2 * math.pi / 12), 24, 96)
+    local segLen = 2 * math.pi * R / n
+    for i = 1, 2 do
+        local c = points[i]
+        if c then
+            for k = 0, n - 1 do
+                local a = k / n * 2 * math.pi
+                local pos = c + Vector3.new(math.cos(a) * R, WALL_HEIGHT / 4, math.sin(a) * R)
+
+                -- jika segmen ini berada di dalam lingkaran titik lainnya (area bertemu) -> jangan digambar
+                local inside = false
+                local other = points[3 - i]
+                if other then
+                    local dx, dz = pos.X - other.X, pos.Z - other.Z
+                    inside = math.sqrt(dx * dx + dz * dz) < R
+                end
+                if not inside then
+                    local p = Instance.new("Part")
+                    p.Anchored = true
+                    p.CanCollide = false
+                    p.CanQuery = false
+                    p.CanTouch = false
+                    p.CastShadow = false
+                    p.Material = Enum.Material.Neon
+                    p.Color = WALL_COLOR
+                    p.Transparency = WALL_TRANSPARENCY
+                    p.Size = Vector3.new(segLen + 0.3, WALL_HEIGHT, 0.5)
+                    p.CFrame = CFrame.lookAt(pos, Vector3.new(c.X, pos.Y, c.Z))
+                    p.Parent = wallFolder
+                end
+            end
+
+            -- bola merah penanda titik tengah
+            local ball = Instance.new("Part")
+            ball.Shape = Enum.PartType.Ball
+            ball.Anchored = true
+            ball.CanCollide = false
+            ball.CanQuery = false
+            ball.CanTouch = false
+            ball.CastShadow = false
+            ball.Material = Enum.Material.Neon
+            ball.Color = WALL_COLOR
+            ball.Transparency = 0.15
+            ball.Size = Vector3.new(CENTER_SIZE, CENTER_SIZE, CENTER_SIZE)
+            ball.Position = c
+            ball.Parent = wallFolder
+        end
+    end
+end
+
+local function alive(e)
+    local h = e.m and e.m.Parent and e.m:FindFirstChildOfClass("Humanoid")
+    return e.m ~= nil and e.m.Parent ~= nil and (not h or h.Health > 0)
+end
+
+local cache = { t = -1e9, hounds = {}, avoid = {} }
+
+local function invalidate()
+    cache.t = -1e9
+end
+
+local function mark(m, color)
+    if not hlFolder then return end
+    local h = hlMap[m]
+    if not h or not h.Parent then
+        h = Instance.new("Highlight")
+        h.Adornee = m
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.FillTransparency = 0.6
+        h.OutlineTransparency = 0
+        h.Parent = hlFolder
+        hlMap[m] = h
+    end
+    h.FillColor = color
+    h.OutlineColor = color
+end
+
+-- scan penuh workspace hanya tiap "Scan ulang" detik (default 10), kecuali force
+local function scan(force)
+    if not force and os.clock() - cache.t < math.max(num("scanint"), 1) then return cache end
+    cache.t = os.clock()
+    local hounds, avoid, seen = {}, {}, {}
+    local keys = targetKeys()
+    local avoidExtra = num("avoid") -- monster yang dihindari dideteksi sedikit lebih luas dari area
+
+    local function add(list, m, extra)
+        if seen[m] then return end
+        local h = m:FindFirstChildOfClass("Humanoid")
+        local p = mobPart(m)
+        if p and (not h or h.Health > 0) and inArea(p.Position, extra) then
+            seen[m] = true
+            table.insert(list, { m = m, p = p })
+        end
+    end
+
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o:IsA("Model") then
+            if not Players:GetPlayerFromCharacter(o) then
+                if nameMatches(o, keys) then
+                    add(hounds, o, 0)
+                elseif nameMatches(o, AVOID) then
+                    add(avoid, o, avoidExtra)
+                end
+            end
+        elseif o:IsA("TextLabel") and o.Text ~= "" then
+            local t = o.Text:lower()
+            local list
+            for _, key in ipairs(keys) do
+                if t:find(key, 1, true) then list = hounds break end
+            end
+            if not list then
+                for _, key in ipairs(AVOID) do
+                    if t:find(key, 1, true) then list = avoid break end
+                end
+            end
+            if list then
+                local m = o:FindFirstAncestorOfClass("Model")
+                if m and m:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(m) then
+                    add(list, m, list == hounds and 0 or avoidExtra)
+                end
+            end
+        end
+    end
+
+    cache.hounds, cache.avoid = hounds, avoid
+
+    -- tandai: target = hijau, dihindari = kuning
+    if hlFolder then
+        for m, h in pairs(hlMap) do
+            if not seen[m] or not m.Parent then
+                h:Destroy()
+                hlMap[m] = nil
+            end
+        end
+        for _, e in ipairs(hounds) do mark(e.m, COLOR_TARGET) end
+        for _, e in ipairs(avoid) do mark(e.m, COLOR_AVOID) end
+    end
+    return cache
+end
+
+local function nearest(list, pos)
+    local best, bestD
+    for _, e in ipairs(list) do
+        if e.p and e.p.Parent and alive(e) then
+            local d = (e.p.Position - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = e, d end
+        end
+    end
+    return best, bestD
+end
+
+local function findMob(root)
+    local c = scan()
+    local best, bestD = nil, num("range")
+    for _, e in ipairs(c.hounds) do
+        if e.p.Parent and alive(e) and inArea(e.p.Position) then
+            local d = (e.p.Position - root.Position).Magnitude
+            if d < bestD then
+                local safe = true
+                for _, a in ipairs(c.avoid) do
+                    if a.p.Parent and (a.p.Position - e.p.Position).Magnitude < num("avoid") then
+                        safe = false
+                        break
+                    end
+                end
+                if safe then best, bestD = e.m, d end
+            end
+        end
+    end
+    return best, bestD
+end
+
+local function nearestAvoid(root)
+    return nearest(scan().avoid, root.Position)
+end
+
+local function threatened()
+    local _, _, r = getChar()
+    if not r then return false end
+    local a, d = nearestAvoid(r)
+    return a ~= nil and d < num("avoid")
+end
+
+-- true hanya jika target sudah dekat (jarak datar <= "Jarak dekat" + 10)
+local function houndNear(mob)
+    local _, _, r = getChar()
+    if not r then return false end
+    local limit = num("stop") + 10
+    local function within(part)
+        local d = Vector3.new(part.Position.X - r.Position.X, 0, part.Position.Z - r.Position.Z).Magnitude
+        return d <= limit
+    end
+    if mob then
+        local p = mob.Parent and mobPart(mob)
+        return p ~= nil and within(p)
+    end
+    for _, e in ipairs(scan().hounds) do
+        if e.p.Parent and alive(e) and within(e.p) then return true end
+    end
+    return false
+end
+
+-- target hidup terdekat yang sudah dalam jangkauan serang (jarak datar <= "Jarak dekat" + 10)
+local function nearHound(root)
+    local limit = num("stop") + 10
+    local best, bestD
+    for _, e in ipairs(scan().hounds) do
+        if e.p.Parent and alive(e) then
+            local d = Vector3.new(e.p.Position.X - root.Position.X, 0, e.p.Position.Z - root.Position.Z).Magnitude
+            if d <= limit and (not bestD or d < bestD) then best, bestD = e, d end
+        end
+    end
+    return best
+end
+
+-- satu "tick" serangan (dipakai fight, flee, dodge):
+--  * MP cukup & jeda E sudah lewat -> tekan skill E (prioritas)
+--  * selama menunggu jeda E        -> klik kiri (tidak diam)
+--  * MP minimum (mpRest)           -> klik kiri saja sampai MP pulih
+local lastAtkClick = 0
+local function attackTick()
+    local now = os.clock()
+    if not mpRest and now - lastE >= math.max(num("eint"), 0.1) then
+        tap(Enum.KeyCode.E)
+        lastE = os.clock()
+        return
+    end
+    if num("gapclk") > 0 and now - lastAtkClick >= math.max(num("cint"), 0.05) then
+        click()
+        lastAtkClick = os.clock()
+    end
+end
+
+local function sleep(t)
+    local s = os.clock()
+    while os.clock() - s < t do
+        if not running or damaged or recovering or threatened() then return false end
+        task.wait(0.03)
+    end
+    return running and not damaged and not recovering
+end
+
+----------------------------------------------------------------
+-- KAMERA
+----------------------------------------------------------------
+RunService:BindToRenderStep("PHCamLock", Enum.RenderPriority.Camera.Value + 1, function()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    if running and not recovering and camFocus and camFocus.Parent then
+        cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position, camFocus.Position), 0.3)
+        return
+    end
+    if not running or recovering or not lockMob or not lockMob.Parent then return end
+    local p = mobPart(lockMob)
+    if p then
+        cam.CFrame = CFrame.lookAt(cam.CFrame.Position, p.Position)
+    end
+end)
+
+----------------------------------------------------------------
+-- NAVIGASI: HINDARI TEMBOK / BATU
+----------------------------------------------------------------
+local function rotY(v, deg)
+    local r = math.rad(deg)
+    local c, s = math.cos(r), math.sin(r)
+    return Vector3.new(v.X * c - v.Z * s, 0, v.X * s + v.Z * c)
+end
+
+local function rayParams()
+    local ignore = {}
+    if lp.Character then table.insert(ignore, lp.Character) end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(ignore, pl.Character) end
+    end
+    local c = scan()
+    for _, e in ipairs(c.hounds) do table.insert(ignore, e.m) end
+    for _, e in ipairs(c.avoid) do table.insert(ignore, e.m) end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = ignore
+    return rp
+end
+
+local function solid(inst)
+    return inst:IsA("Terrain") or inst.CanCollide
+end
+
+local function blocked(root, dir, rp)
+    local dist = num("wall")
+    for _, h in ipairs({ 0, -1.5 }) do
+        local origin = root.Position + Vector3.new(0, h, 0)
+        local res = workspace:Raycast(origin, dir * dist, rp)
+        local n = 0
+        while res and not solid(res.Instance) and n < 4 do
+            local f = rp.FilterDescendantsInstances
+            table.insert(f, res.Instance)
+            rp.FilterDescendantsInstances = f
+            res = workspace:Raycast(origin, dir * dist, rp)
+            n += 1
+        end
+        if res and solid(res.Instance) then return true end
+    end
+    return false
+end
+
+local function navDir(root, desired)
+    local now = os.clock()
+    local rp = rayParams()
+
+    if now < detour.untilT then
+        local d = rotY(desired, detour.ang)
+        if not blocked(root, d, rp) then return d, true end
+        detour.untilT = 0
+    end
+
+    if not blocked(root, desired, rp) then return desired, false end
+
+    local order = { 45, -45, 90, -90, 135, -135, 180 }
+    if math.random() < 0.5 then order = { -45, 45, -90, 90, -135, 135, 180 } end
+    for _, a in ipairs(order) do
+        local d = rotY(desired, a)
+        if not blocked(root, d, rp) then
+            detour.ang = a
+            detour.untilT = now + num("turn")
+            return d, true
+        end
+    end
+    detour.ang, detour.untilT = 180, now + num("turn")
+    return rotY(desired, 180), true
+end
+
+local function checkStuck(root, hum)
+    local now = os.clock()
+    local flatPos = Vector3.new(root.Position.X, 0, root.Position.Z)
+    if not lastPos then
+        lastPos, lastPosT = flatPos, now
+        return
+    end
+    if now - lastPosT >= 0.4 then
+        if (flatPos - lastPos).Magnitude < 0.7 then
+            detour.ang = (math.random() < 0.5) and 90 or -90
+            detour.untilT = now + num("turn")
+            if hum then hum.Jump = true end
+        end
+        lastPos, lastPosT = flatPos, now
+    end
+end
+
+----------------------------------------------------------------
+-- GERAK
+----------------------------------------------------------------
+local function steer(dir)
+    local cf = workspace.CurrentCamera.CFrame
+    local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+    local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+    look = look.Magnitude > 0 and look.Unit or Vector3.new(0, 0, -1)
+    right = right.Magnitude > 0 and right.Unit or Vector3.new(1, 0, 0)
+    local f, r = dir:Dot(look), dir:Dot(right)
+    local function axis(key, v)
+        local on = held[key]
+        setKey(key, (on and v > 0.18) or (not on and v > 0.4))
+    end
+    axis(Enum.KeyCode.W, f)
+    axis(Enum.KeyCode.S, -f)
+    axis(Enum.KeyCode.D, r)
+    axis(Enum.KeyCode.A, -r)
+end
+
+local function moveDir(hum, root, dir)
+    checkStuck(root, hum)
+    local d = navDir(root, dir)
+    if mode == 3 then hum:MoveTo(root.Position + d * 12) else steer(d) end
+end
+
+local function moveAway(hum, root, fromPos)
+    local away = Vector3.new(root.Position.X - fromPos.X, 0, root.Position.Z - fromPos.Z)
+    away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
+    moveDir(hum, root, away)
+end
+
+----------------------------------------------------------------
+-- AKSI
+----------------------------------------------------------------
+local function approach(mob, sid)
+    local t0 = os.clock()
+    lockMob = mob
+    lastPos = nil
+    while running and sid == session do
+        if damaged or recovering then releaseAll() return false end
+        local _, hum, root = getChar()
+        local mp = mob.Parent and mobPart(mob)
+        local mh = mob:FindFirstChildOfClass("Humanoid")
+        if not root or not mp or (mh and mh.Health <= 0) then releaseAll() return false end
+
+        local a, ad = nearestAvoid(root)
+        if a and ad < num("avoid") then releaseAll() return false end
+
+        local diff = mp.Position - root.Position
+        local flat = Vector3.new(diff.X, 0, diff.Z)
+        if flat.Magnitude <= num("stop") then releaseAll() return true end
+        if os.clock() - t0 > 25 then releaseAll() return false end
+
+        checkStuck(root, hum)
+        local dir, turning = navDir(root, flat.Unit)
+        setStatus(string.format("%s (%.0f stud)", turning and "Belok (halangan)" or "Mendekati", flat.Magnitude))
+
+        if mode == 3 then
+            if turning then hum:MoveTo(root.Position + dir * 12) else hum:MoveTo(mp.Position) end
+        else
+            steer(dir)
+        end
+        task.wait(0.05)
+    end
+    releaseAll()
+    return false
+end
+
+-- Serangan saat dekat target:
+--  * MP cukup  -> PRIORITAS skill E tiap "Jeda E" detik. Di sela jeda E -> klik kiri (tidak diam).
+--  * MP minimum (mpRest) -> klik kiri saja sampai MP pulih (mencapai "MP lanjut").
+-- Tombol "1" TIDAK ditekan di sini (hanya sekali saat START / setelah respawn).
+-- Kena damage tidak membatalkan serangan; yang membatalkan: bot stop, mode pulih HP,
+-- monster yang dihindari mendekat, target mati, atau target menjauh.
+local function fight(mob)
+    local function isAlive()
+        local h = mob and mob.Parent and mob:FindFirstChildOfClass("Humanoid")
+        return mob ~= nil and mob.Parent ~= nil and (not h or h.Health > 0)
+    end
+    local function canGo()
+        return running and not recovering and not threatened() and isAlive()
+    end
+    local step = math.max(num("cint"), 0.05)
+
+    if not houndNear(mob) then return end -- belum dekat -> jangan mulai
+
+    while canGo() do
+        if not houndNear(mob) then return end
+
+        if not mpRest and os.clock() - lastE >= math.max(num("eint"), 0.1) then
+            -- MP cukup & jeda E lewat: PRIORITAS skill E
+            setStatus("Skill E")
+            tap(Enum.KeyCode.E)
+            lastE = os.clock()
+        else
+            -- menunggu jeda E (atau MP minimum): serang pakai klik kiri, jangan diam
+            setStatus(mpRest and "MP minimum - klik kiri" or "Tunggu jeda E - klik kiri")
+            if num("gapclk") > 0 then click() end
+        end
+
+        task.wait(step)
+    end
+end
+
+-- menghindar setelah kena damage (bukan mode pulih): bergerak sambil menyerang
+-- (skill E diprioritaskan, klik hanya saat MP minimum)
+local function dodge(sid)
+    setStatus("Menghindar + serang!")
+    local _, h0 = getChar()
+    if h0 then h0.Jump = true end
+    local ang = math.rad(math.random(0, 359))
+    local base = Vector3.new(math.cos(ang), 0, math.sin(ang))
+    lastPos = nil
+    local s = os.clock()
+    while running and sid == session and os.clock() - s < num("dodge") and not recovering do
+        local _, hum, root = getChar()
+        if not root then break end
+        moveDir(hum, root, base)
+        if (num("fleeatk") > 0 or num("dodgeclk") > 0) and houndNear() then
+            attackTick()
+        end
+        task.wait(0.05)
+    end
+    releaseAll()
+    damaged = false
+end
+
+local function segDist(p, a, b)
+    local ap = Vector3.new(p.X - a.X, 0, p.Z - a.Z)
+    local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+    local l2 = ab:Dot(ab)
+    if l2 < 1e-3 then return ap.Magnitude end
+    local t = math.clamp(ap:Dot(ab) / l2, 0, 1)
+    return (ap - ab * t).Magnitude
+end
+
+local orbitDir = 1
+
+local function flee(sid)
+    lastPos = nil
+    local smooth
+    local flipLock, stuckPos, stuckT = 0, nil, os.clock()
+    local t0, lastScan, mob = os.clock(), 0, nil
+
+    while running and sid == session and not recovering do
+        local _, hum, root = getChar()
+        if not root then break end
+        local a, ad = nearestAvoid(root)
+        if not a or ad >= num("avoid") + 30 then break end
+        local now = os.clock()
+        if now - t0 > 90 then break end
+
+        if now - lastScan > 0.3 then
+            lastScan = now
+            mob = findMob(root)
+        end
+        local mp = mob and mob.Parent and mobPart(mob)
+        if mp and ad >= num("avoid") then
+            local clear = true
+            for _, e in ipairs(scan().avoid) do
+                if e.p.Parent and segDist(e.p.Position, root.Position, mp.Position) < num("avoid") then
+                    clear = false
+                    break
+                end
+            end
+            if clear then break end
+        end
+
+        local ap = a.p.Position
+        local rad = Vector3.new(root.Position.X - ap.X, 0, root.Position.Z - ap.Z)
+        local dist = rad.Magnitude
+        local out = dist > 0.1 and rad / dist or Vector3.new(1, 0, 0)
+
+        if mp and now > flipLock then
+            local tan = Vector3.new(-out.Z, 0, out.X)
+            local toMob = Vector3.new(mp.Position.X - root.Position.X, 0, mp.Position.Z - root.Position.Z)
+            local want = tan:Dot(toMob) >= 0 and 1 or -1
+            if want ~= orbitDir then orbitDir = want flipLock = now + 2 end
+        end
+
+        local function compute()
+            local tan = Vector3.new(-out.Z, 0, out.X) * orbitDir
+            local R = num("avoid") + 8
+            local k = math.clamp((R - dist) / 12, -0.6, 1.2)
+            local d = tan + out * k
+            return d.Magnitude > 0.01 and d.Unit or out
+        end
+
+        local desired = compute()
+        local rp = rayParams()
+        if blocked(root, desired, rp) and now > flipLock then
+            orbitDir = -orbitDir
+            flipLock = now + 1.5
+            smooth = nil
+            desired = compute()
+            if blocked(root, desired, rp) then desired = navDir(root, desired) end
+        end
+
+        smooth = smooth and smooth:Lerp(desired, 0.2) or desired
+        if smooth.Magnitude < 0.05 then smooth = desired end
+        local dirv = smooth.Unit
+
+        -- kalau ada target dalam jangkauan, kamera diarahkan ke target (bukan ke monster yang dihindari)
+        -- supaya klik/skill mengenai target
+        local th = num("fleeatk") > 0 and nearHound(root) or nil
+        camFocus = th and th.p or a.p
+        setStatus(string.format("Mengitari %s (%.0f)%s", a.m.Name, dist,
+            th and " + SERANG" or (mp and " - ke target" or " - cari target")))
+        if mode == 3 then hum:MoveTo(root.Position + dirv * 12) else steer(dirv) end
+        if th then attackTick() end
+
+        local flat = Vector3.new(root.Position.X, 0, root.Position.Z)
+        if not stuckPos then
+            stuckPos, stuckT = flat, now
+        elseif now - stuckT >= 0.6 then
+            if (flat - stuckPos).Magnitude < 0.8 then
+                orbitDir = -orbitDir
+                flipLock = now + 1
+                smooth = nil
+                hum.Jump = true
+            end
+            stuckPos, stuckT = flat, now
+        end
+        task.wait(0.05)
+    end
+    camFocus = nil
+    releaseAll()
+end
+
+local function goTo(target, sid, tol, label)
+    local t0 = os.clock()
+    lastPos = nil
+    lockMob = nil
+    while running and sid == session do
+        local _, hum, root = getChar()
+        if not root then releaseAll() return false end
+
+        local diff = target - root.Position
+        local flat = Vector3.new(diff.X, 0, diff.Z)
+        if flat.Magnitude <= tol then releaseAll() return true end
+        if os.clock() - t0 > 60 then releaseAll() return false end
+
+        checkStuck(root, hum)
+        local dir, turning = navDir(root, flat.Unit)
+        setStatus(string.format("%s (%.0f stud)", label, flat.Magnitude))
+
+        if mode == 3 then
+            if turning then hum:MoveTo(root.Position + dir * 12) else hum:MoveTo(target) end
+        else
+            steer(dir)
+        end
+        task.wait(0.05)
+    end
+    releaseAll()
+    return false
+end
+
+-- MODE PULIH: pergi ke SAFE_POS, diam sampai HP >= batas pulih, lalu kembali ke FARM_POS
+local function recover(sid)
+    releaseAll()
+    lockMob = nil
+    damaged = false
+
+    goTo(SAFE_POS, sid, 6, "Ke zona aman")
+    damaged = false
+
+    local fleeing = false
+    local panicUntil, panicDir = 0, Vector3.new(1, 0, 0)
+
+    local function startFlee()
+        if fleeing then return end
+        fleeing = true
+        releaseAll()
+        resetKeyState()
+        lastPos = nil
+    end
+
+    while running and sid == session do
+        local _, hum, root = getChar()
+        if not root then break end
+        if curHp == nil then break end
+
+        local target = okTarget()
+        if curHp >= target then break end
+
+        local c = scan()
+        local h, hd = nearest(c.hounds, root.Position)
+        local a, ad = nearest(c.avoid, root.Position)
+        local danger, dist = h, hd
+        if a and (not h or ad < hd) then danger, dist = a, ad end
+
+        local trigger = num("safe") + (fleeing and 20 or 0)
+        local now = os.clock()
+
+        if danger and dist < trigger then
+            startFlee()
+            damaged = false
+            setStatus(string.format("MENGHINDAR %d/%d (%.0f)", curHp, target, dist))
+            moveAway(hum, root, danger.p.Position)
+        elseif damaged or now < panicUntil then
+            if now >= panicUntil then
+                panicUntil = now + 1.5
+                local ang = math.rad(math.random(0, 359))
+                panicDir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+                damaged = false
+            end
+            startFlee()
+            setStatus(string.format("MENGHINDAR (diserang) %d/%d", curHp, target))
+            moveDir(hum, root, panicDir)
+        else
+            if fleeing then
+                releaseAll()
+                fleeing = false
+            end
+            setStatus(string.format("Aman, pulih %d/%d", curHp, target))
+        end
+        task.wait(0.1)
+    end
+    releaseAll()
+
+    local _, _, r = getChar()
+    if r and running and sid == session then
+        goTo(FARM_POS, sid, 6, "Kembali ke titik farm")
+    end
+
+    recovering = false
+    damaged = false
+    lastHp = curHp
+    -- (sengaja TIDAK menekan "1" lagi setelah pulih HP; "1" hanya saat START dan setelah respawn)
+end
+
+----------------------------------------------------------------
+-- DETEKSI MATI + RESPAWN
+----------------------------------------------------------------
+local function cleanText(s)
+    return (s:gsub("<[^>]+>", ""):lower())
+end
+
+local function guiVisible(o)
+    local cur = o
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function findText(needle, wantButton)
+    local pg = lp:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, o in ipairs(pg:GetDescendants()) do
+        if not (gui and o:IsDescendantOf(gui)) then
+            if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text ~= "" then
+                if cleanText(o.Text):find(needle, 1, true) and guiVisible(o) then
+                    if wantButton then
+                        if o:IsA("GuiButton") then return o end
+                        return o:FindFirstAncestorWhichIsA("GuiButton") or o
+                    end
+                    return o
+                end
+            elseif wantButton and o:IsA("GuiButton") and o.Name:lower():find(needle, 1, true) and guiVisible(o) then
+                return o
+            end
+        end
+    end
+end
+
+local function findRespawn()
+    return findText("respawn", true)
+end
+
+local deathCache, deathT = false, 0
+local function deathShowing()
+    if os.clock() - deathT > 0.5 then
+        deathT = os.clock()
+        deathCache = findText("you died") ~= nil
+    end
+    return deathCache
+end
+
+local function clickGui(o, useFallback)
+    local pos, size = o.AbsolutePosition, o.AbsoluteSize
+    local sg = o:FindFirstAncestorWhichIsA("ScreenGui")
+    local inset = Vector2.zero
+    if not (sg and sg.IgnoreGuiInset) then inset = GuiService:GetGuiInset() end
+    local x = pos.X + size.X / 2 + inset.X
+    local y = pos.Y + size.Y / 2 + inset.Y
+    VIM:SendMouseMoveEvent(x, y, game)
+    task.wait(0.05)
+    VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+    task.wait(0.05)
+    VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+
+    if useFallback and getconnections and o:IsA("GuiButton") then
+        pcall(function()
+            for _, ev in ipairs({ o.MouseButton1Click, o.Activated }) do
+                for _, c in ipairs(getconnections(ev)) do c:Fire() end
+            end
+        end)
+    end
+end
+
+local function waitHpFull(sid)
+    local t0 = os.clock()
+    local moving = false
+    task.wait(0.5)
+    while running and sid == session do
+        local _, hum, root = getChar()
+        if root and curHp == nil then break end
+        if root then
+            local target = curMax or okTarget()
+            if curHp >= target - 0.5 then break end
+            setStatus(string.format("Menunggu HP penuh %d/%d", curHp, target))
+
+            local c = scan()
+            local h, hd = nearest(c.hounds, root.Position)
+            local a, ad = nearest(c.avoid, root.Position)
+            local danger, dist = h, hd
+            if a and (not h or ad < hd) then danger, dist = a, ad end
+            if danger and dist < num("safe") then
+                moving = true
+                moveAway(hum, root, danger.p.Position)
+            elseif moving then
+                releaseAll()
+                moving = false
+            end
+        else
+            setStatus("Menunggu karakter...")
+        end
+        if os.clock() - t0 > 120 then break end
+        task.wait(0.1)
+    end
+    releaseAll()
+end
+
+local function handleDeath(sid)
+    releaseAll()
+    lockMob = nil
+    recovering = false
+    damaged = false
+    local clicks, lastTry = 0, 0
+
+    while running and sid == session do
+        local _, _, root = getChar()
+        local died = findText("you died")
+        if root and not died then break end
+
+        if died then
+            local btn = findRespawn()
+            if btn then
+                if os.clock() - lastTry >= 1.5 then
+                    setStatus("Klik tombol Respawn...")
+                    clickGui(btn, clicks >= 1)
+                    clicks += 1
+                    lastTry = os.clock()
+                end
+            else
+                setStatus("You Died - menunggu tombol Respawn...")
+            end
+        else
+            setStatus("Menunggu karakter...")
+        end
+        task.wait(0.2)
+    end
+
+    if running and sid == session then
+        waitHpFull(sid)
+    end
+
+    local _, _, r = getChar()
+    if r and running and sid == session then
+        goTo(FARM_POS, sid, 6, "Ke titik farm")
+    end
+
+    -- setelah respawn: tekan Q sekali untuk masuk siaga tempur sebelum berburu
+    if running and sid == session and getChar() then
+        setStatus("Siaga tempur (Q)...")
+        task.wait(0.3)
+        tap(Enum.KeyCode.Q)
+        task.wait(0.7)
+    end
+
+    recovering = false
+    damaged = false
+    lastHp = curHp
+    lockMob = nil
+    deathT = 0
+    needSkill1 = true -- selesai respawn -> tekan "1" lagi sekali
+end
+
+----------------------------------------------------------------
+-- LOOP UTAMA
+----------------------------------------------------------------
+local function mainLoop(sid)
+    while running and sid == session do
+        local _, hum, root = getChar()
+        if not root or deathShowing() then
+            handleDeath(sid)
+        else
+            if lowHp() then recovering = true end
+
+            if recovering then
+                recover(sid)
+            else
+                damaged = false
+
+                -- tekan "1" (aktifkan skill) SEKALI: HANYA saat start / setelah respawn
+                if needSkill1 then
+                    setStatus("Aktifkan skill 1")
+                    tap(Enum.KeyCode.One)
+                    needSkill1 = false
+                    task.wait(0.3)
+                end
+
+                flee(sid)
+
+                setStatus(#targetKeys() == 0 and "Pilih target dulu!" or "Mencari target...")
+                local _, _, r2 = getChar()
+                local mob, dist = nil, nil
+                if r2 then mob, dist = findMob(r2) end
+                if not mob then
+                    lockMob = nil
+                    if #targetKeys() == 0 then
+                        setStatus("Pilih target dulu!")
+                    else
+                        setStatus("Tidak ketemu (range " .. num("range") .. ")")
+                    end
+                    task.wait(0.7)
+                else
+                    print("[HuntBot] Target:", mob:GetFullName(), math.floor(dist) .. " stud")
+                    if approach(mob, sid) then fight(mob) end
+                    if recovering then
+                        releaseAll()
+                    elseif damaged then
+                        dodge(sid)
+                    end
+                    lockMob = nil
+                end
+            end
+        end
+        task.wait()
+    end
+    lockMob = nil
+    releaseAll()
+end
+
+lp.CharacterAdded:Connect(function()
+    recovering = false
+    lockMob = nil
+    lastHp = nil
+    guiLabel = nil
+    mpGuiLabel = nil
+    lastPos = nil
+    needSkill1 = true -- respawn -> "1" ditekan sekali lagi
+end)
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+gui = Instance.new("ScreenGui")
+gui.Name = "PatchHoundBot"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+local ok = pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not ok or not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+hlFolder = Instance.new("Folder")
+hlFolder.Name = "Marks"
+hlFolder.Parent = gui
+
+local function corner(o, r) local c = Instance.new("UICorner", o) c.CornerRadius = UDim.new(0, r or 6) return c end
+
+local main = Instance.new("Frame", gui)
+local FULL_H, MINI_H = 420, 92 -- MINI_H cukup untuk judul + status + tombol START/STOP
+main.Size = UDim2.fromOffset(230, FULL_H)
+main.Position = UDim2.new(0, 20, 0.5, -FULL_H / 2)
+main.ClipsDescendants = true
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 36)
+main.BorderSizePixel = 0
+corner(main, 10)
+local stroke = Instance.new("UIStroke", main)
+stroke.Color = Color3.fromRGB(120, 90, 255)
+stroke.Thickness = 1.5
+
+local title = Instance.new("TextLabel", main)
+title.Size = UDim2.new(1, 0, 0, 28)
+title.BackgroundColor3 = Color3.fromRGB(120, 90, 255)
+title.BorderSizePixel = 0
+title.Text = "🐺  Monster Hunt Bot"
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextColor3 = Color3.new(1, 1, 1)
+corner(title, 10)
+
+local exitBtn = Instance.new("TextButton", title)
+exitBtn.Size = UDim2.fromOffset(22, 20)
+exitBtn.Position = UDim2.new(1, -26, 0, 4)
+exitBtn.BackgroundColor3 = Color3.fromRGB(230, 70, 80)
+exitBtn.Text = "X"
+exitBtn.Font = Enum.Font.GothamBold
+exitBtn.TextSize = 12
+exitBtn.TextColor3 = Color3.new(1, 1, 1)
+corner(exitBtn, 5)
+
+local miniBtn = Instance.new("TextButton", title)
+miniBtn.Size = UDim2.fromOffset(22, 20)
+miniBtn.Position = UDim2.new(1, -52, 0, 4)
+miniBtn.BackgroundColor3 = Color3.fromRGB(240, 170, 50)
+miniBtn.Text = "–"
+miniBtn.Font = Enum.Font.GothamBold
+miniBtn.TextSize = 14
+miniBtn.TextColor3 = Color3.new(1, 1, 1)
+corner(miniBtn, 5)
+
+statusLabel = Instance.new("TextLabel", main)
+statusLabel.Size = UDim2.new(1, -16, 0, 14)
+statusLabel.Position = UDim2.fromOffset(8, 30)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Status: Berhenti"
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 11
+statusLabel.TextColor3 = Color3.fromRGB(190, 190, 220)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+hpLabel = Instance.new("TextLabel", main)
+hpLabel.Size = UDim2.new(1, -16, 0, 12)
+hpLabel.Position = UDim2.fromOffset(8, 43)
+hpLabel.BackgroundTransparency = 1
+hpLabel.Text = "HP ..."
+hpLabel.Font = Enum.Font.GothamBold
+hpLabel.TextSize = 10
+hpLabel.TextColor3 = Color3.fromRGB(120, 230, 160)
+hpLabel.TextXAlignment = Enum.TextXAlignment.Left
+hpLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+mpLabel = Instance.new("TextLabel", main)
+mpLabel.Size = UDim2.new(1, -16, 0, 12)
+mpLabel.Position = UDim2.fromOffset(8, 55)
+mpLabel.BackgroundTransparency = 1
+mpLabel.Text = "MP ..."
+mpLabel.Font = Enum.Font.GothamBold
+mpLabel.TextSize = 10
+mpLabel.TextColor3 = Color3.fromRGB(110, 170, 255)
+mpLabel.TextXAlignment = Enum.TextXAlignment.Left
+mpLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+local scroll = Instance.new("ScrollingFrame", main)
+scroll.Name = "SettingsScroll"
+scroll.Position = UDim2.fromOffset(8, 70)
+scroll.Size = UDim2.new(1, -16, 1, -70 - 50)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(120, 90, 255)
+scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+scroll.ElasticBehavior = Enum.ElasticBehavior.Never
+scroll.CanvasSize = UDim2.fromOffset(0, 530)
+
+local function header(text, y)
+    local l = Instance.new("TextLabel", scroll)
+    l.Size = UDim2.new(1, 0, 0, 14)
+    l.Position = UDim2.fromOffset(0, y)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 10
+    l.TextColor3 = Color3.fromRGB(190, 190, 220)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    return l
+end
+
+local function smallBtn(text, x, y, color)
+    local b = Instance.new("TextButton", scroll)
+    b.Size = UDim2.fromOffset(101, 22)
+    b.Position = UDim2.fromOffset(x, y)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.BorderSizePixel = 0
+    corner(b, 6)
+    return b
+end
+
+-- ===== TITIK SCAN 1 & 2 =====
+header("Titik pusat scan (ketik X, Y, Z lalu OK):", 0)
+
+local setBtn1 = smallBtn("📍 Set Titik 1", 0, 16, Color3.fromRGB(60, 120, 200))
+local setBtn2 = smallBtn("📍 Set Titik 2", 105, 16, Color3.fromRGB(60, 120, 200))
+local resetBtn1 = smallBtn("✖ Reset 1", 0, 42, Color3.fromRGB(170, 70, 80))
+local resetBtn2 = smallBtn("✖ Reset 2", 105, 42, Color3.fromRGB(170, 70, 80))
+
+local pointLabels = {}
+for i = 1, 2 do
+    local l = Instance.new("TextLabel", scroll)
+    l.Size = UDim2.fromOffset(101, 12)
+    l.Position = UDim2.fromOffset((i - 1) * 105, 67)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 9
+    l.TextColor3 = Color3.fromRGB(160, 200, 255)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    pointLabels[i] = l
+end
+
+-- kotak input koordinat manual: satu kotak teks per titik, format "X, Y, Z" (contoh: -166, 45, -349)
+local coordBoxes = {}
+local COORD_Y = { 82, 106 }
+for i = 1, 2 do
+    local b = Instance.new("TextBox", scroll)
+    b.Size = UDim2.fromOffset(160, 20)
+    b.Position = UDim2.fromOffset(0, COORD_Y[i])
+    b.BackgroundColor3 = Color3.fromRGB(55, 55, 80)
+    b.BorderSizePixel = 0
+    b.Text = ""
+    b.PlaceholderText = "Titik " .. i .. ": X, Y, Z"
+    b.PlaceholderColor3 = Color3.fromRGB(140, 140, 170)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    b.ClearTextOnFocus = false
+    corner(b, 4)
+    coordBoxes[i] = b
+end
+
+local function refreshPoints()
+    for i = 1, 2 do
+        local p = points[i]
+        pointLabels[i].Text = p
+            and string.format("T%d: %d, %d, %d", i, p.X, p.Y, p.Z)
+            or string.format("T%d: belum diset", i)
+        if not coordBoxes[i]:IsFocused() then
+            coordBoxes[i].Text = p and string.format("%d, %d, %d", math.floor(p.X + 0.5), math.floor(p.Y + 0.5), math.floor(p.Z + 0.5)) or ""
+        end
+    end
+end
+refreshPoints()
+
+-- terapkan koordinat yang diketik manual (3 angka dipisah koma / spasi)
+local function applyCoord(i)
+    local v = {}
+    for n in coordBoxes[i].Text:gmatch("-?%d+%.?%d*") do
+        table.insert(v, tonumber(n))
+    end
+    if #v ~= 3 then
+        setStatus("Koordinat T" .. i .. " tidak valid (format: X, Y, Z)")
+        return
+    end
+    points[i] = Vector3.new(v[1], v[2], v[3])
+    refreshPoints()
+    drawWalls()
+    invalidate() -- scan ulang segera dengan area baru
+    setStatus(string.format("Titik %d diset: %d, %d, %d", i, v[1], v[2], v[3]))
+end
+
+for i = 1, 2 do
+    local ok = Instance.new("TextButton", scroll)
+    ok.Size = UDim2.fromOffset(41, 20)
+    ok.Position = UDim2.fromOffset(165, COORD_Y[i])
+    ok.BackgroundColor3 = Color3.fromRGB(50, 150, 100)
+    ok.Text = "OK " .. i
+    ok.Font = Enum.Font.GothamBold
+    ok.TextSize = 10
+    ok.TextColor3 = Color3.new(1, 1, 1)
+    ok.BorderSizePixel = 0
+    corner(ok, 5)
+    ok.MouseButton1Click:Connect(function() applyCoord(i) end)
+    -- tekan Enter di kotak juga langsung menerapkan
+    coordBoxes[i].FocusLost:Connect(function(enter)
+        if enter then applyCoord(i) end
+    end)
+end
+
+local function setPoint(i)
+    local _, _, r = getChar()
+    if not r then
+        setStatus("Karakter belum siap, titik tidak diset")
+        return
+    end
+    points[i] = r.Position
+    refreshPoints()
+    drawWalls()
+    invalidate() -- scan ulang segera dengan area baru
+end
+
+local function resetPoint(i)
+    points[i] = nil
+    refreshPoints()
+    drawWalls()
+    invalidate()
+end
+
+setBtn1.MouseButton1Click:Connect(function() setPoint(1) end)
+setBtn2.MouseButton1Click:Connect(function() setPoint(2) end)
+resetBtn1.MouseButton1Click:Connect(function() resetPoint(1) end)
+resetBtn2.MouseButton1Click:Connect(function() resetPoint(2) end)
+
+scanLabel = Instance.new("TextLabel", scroll)
+scanLabel.Size = UDim2.new(1, 0, 0, 12)
+scanLabel.Position = UDim2.fromOffset(0, 130)
+scanLabel.BackgroundTransparency = 1
+scanLabel.Text = "Scan: ..."
+scanLabel.Font = Enum.Font.Gotham
+scanLabel.TextSize = 9
+scanLabel.TextColor3 = Color3.fromRGB(170, 230, 170)
+scanLabel.TextXAlignment = Enum.TextXAlignment.Left
+scanLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+local wallBtn = Instance.new("TextButton", scroll)
+wallBtn.Size = UDim2.fromOffset(206, 22)
+wallBtn.Position = UDim2.fromOffset(0, 144)
+wallBtn.Font = Enum.Font.GothamBold
+wallBtn.TextSize = 10
+wallBtn.TextColor3 = Color3.new(1, 1, 1)
+wallBtn.BorderSizePixel = 0
+corner(wallBtn, 6)
+local function refreshWallBtn()
+    wallBtn.Text = wallsOn and "🧱 Dinding merah: ON" or "🧱 Dinding merah: OFF"
+    wallBtn.BackgroundColor3 = wallsOn and Color3.fromRGB(190, 60, 60) or Color3.fromRGB(60, 60, 95)
+end
+refreshWallBtn()
+wallBtn.MouseButton1Click:Connect(function()
+    wallsOn = not wallsOn
+    refreshWallBtn()
+    drawWalls()
+end)
+
+-- ===== TARGET =====
+header("Target buruan (klik untuk pilih):", 172)
+
+local TGT_Y = 189
+for i, t in ipairs(TARGETS) do
+    local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+    local b = Instance.new("TextButton", scroll)
+    b.Size = UDim2.fromOffset(101, 22)
+    b.Position = UDim2.fromOffset(col * 105, TGT_Y + row * 26)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.BorderSizePixel = 0
+    corner(b, 6)
+    local function refresh()
+        b.Text = (t.on and "✔ " or "✘ ") .. t.name
+        b.BackgroundColor3 = t.on and Color3.fromRGB(50, 150, 100) or Color3.fromRGB(60, 60, 95)
+    end
+    refresh()
+    b.MouseButton1Click:Connect(function()
+        t.on = not t.on
+        refresh()
+        invalidate()
+        lockMob = nil
+    end)
+end
+
+-- ===== SETTING =====
+local settings = {
+    { "scanr", "Radius scan" }, { "scanint", "Scan ulang" },
+    { "eint", "Jeda E (dtk)" }, { "cint", "Intv klik" },
+    { "mplow", "MP stop" }, { "mpok", "MP lanjut" },
+    { "stop", "Jarak dekat" }, { "range", "Jarak deteksi" },
+    { "dodge", "Menghindar" }, { "safe", "Jarak aman" },
+    { "hplow", "HP rendah" }, { "hpok", "HP pulih" },
+    { "avoid", "Jauhi Gob/Btl" }, { "wall", "Jarak tembok" },
+    { "turn", "Waktu belok" }, { "gapclk", "Spam klik" },
+    { "dodgeclk", "Spam hindar" }, { "fleeatk", "Serang hindar" },
+}
+local SET_Y = TGT_Y + math.ceil(#TARGETS / 2) * 26 + 8
+for i, s in ipairs(settings) do
+    local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+    local cell = Instance.new("Frame", scroll)
+    cell.Size = UDim2.fromOffset(104, 24)
+    cell.Position = UDim2.fromOffset(col * 108, SET_Y + row * 29)
+    cell.BackgroundColor3 = Color3.fromRGB(36, 36, 54)
+    cell.BorderSizePixel = 0
+    corner(cell, 6)
+
+    local l = Instance.new("TextLabel", cell)
+    l.Size = UDim2.new(0, 56, 1, 0)
+    l.Position = UDim2.fromOffset(5, 0)
+    l.BackgroundTransparency = 1
+    l.Text = s[2]
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 10
+    l.TextColor3 = Color3.fromRGB(200, 200, 230)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local b = Instance.new("TextBox", cell)
+    b.Size = UDim2.new(0, 38, 0, 18)
+    b.Position = UDim2.new(1, -42, 0.5, -9)
+    b.BackgroundColor3 = Color3.fromRGB(55, 55, 80)
+    b.BorderSizePixel = 0
+    b.Text = tostring(DEFAULTS[s[1]])
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.ClearTextOnFocus = false
+    corner(b, 4)
+    boxes[s[1]] = b
+end
+
+local BTN_Y = SET_Y + math.ceil(#settings / 2) * 29 + 4
+
+local modeBtn = Instance.new("TextButton", scroll)
+modeBtn.Size = UDim2.fromOffset(206, 22)
+modeBtn.Position = UDim2.fromOffset(0, BTN_Y)
+modeBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 95)
+modeBtn.Text = "Mode input: VIM  (klik untuk ganti)"
+modeBtn.Font = Enum.Font.Gotham
+modeBtn.TextSize = 11
+modeBtn.TextColor3 = Color3.new(1, 1, 1)
+corner(modeBtn, 6)
+modeBtn.MouseButton1Click:Connect(function()
+    releaseAll()
+    mode = mode % 3 + 1
+    modeBtn.Text = "Mode input: " .. MODE_NAMES[mode] .. "  (klik untuk ganti)"
+end)
+
+local hpBtn = Instance.new("TextButton", scroll)
+hpBtn.Size = UDim2.fromOffset(206, 22)
+hpBtn.Position = UDim2.fromOffset(0, BTN_Y + 27)
+hpBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 95)
+hpBtn.Text = "Sumber HP: AUTO  (klik untuk ganti)"
+hpBtn.Font = Enum.Font.Gotham
+hpBtn.TextSize = 11
+hpBtn.TextColor3 = Color3.new(1, 1, 1)
+corner(hpBtn, 6)
+hpBtn.MouseButton1Click:Connect(function()
+    hpSrc = hpSrc % 4 + 1
+    guiLabel, lastGuiScan, lastHp = nil, 0, nil
+    hpBtn.Text = "Sumber HP: " .. SRC_NAMES[hpSrc] .. "  (klik untuk ganti)"
+end)
+
+scroll.CanvasSize = UDim2.fromOffset(0, BTN_Y + 27 + 22 + 6)
+
+-- ===== TOMBOL START / STOP (tetap tampil saat minimize) =====
+local toggle = Instance.new("TextButton", main)
+toggle.Size = UDim2.new(1, -16, 0, 34)
+toggle.Position = UDim2.new(0, 8, 1, -42)
+toggle.BackgroundColor3 = Color3.fromRGB(50, 190, 120)
+toggle.Text = "▶  START"
+toggle.Font = Enum.Font.GothamBold
+toggle.TextSize = 14
+toggle.TextColor3 = Color3.new(1, 1, 1)
+corner(toggle, 8)
+
+local function stopBot()
+    running = false
+    session += 1
+    recovering = false
+    lockMob = nil
+    releaseAll()
+    toggle.Text = "▶  START"
+    toggle.BackgroundColor3 = Color3.fromRGB(50, 190, 120)
+    setStatus("Berhenti")
+end
+
+local function startBot()
+    running = true
+    session += 1
+    recovering = false
+    damaged = false
+    needSkill1 = true -- tekan "1" sekali di awal aksi
+    lastE = 0
+    toggle.Text = "■  STOP"
+    toggle.BackgroundColor3 = Color3.fromRGB(230, 80, 90)
+    local sid = session
+    task.spawn(mainLoop, sid)
+end
+
+toggle.MouseButton1Click:Connect(function()
+    if running then stopBot() else startBot() end
+end)
+
+local minimized = false
+miniBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    scroll.Visible = not minimized
+    hpLabel.Visible = not minimized
+    mpLabel.Visible = not minimized
+    -- toggle (START/STOP) sengaja TIDAK disembunyikan
+    main.Size = UDim2.fromOffset(230, minimized and MINI_H or FULL_H)
+    miniBtn.Text = minimized and "+" or "–"
+end)
+
+exitBtn.MouseButton1Click:Connect(function()
+    stopBot()
+    pcall(function() RunService:UnbindFromRenderStep("PHCamLock") end)
+    clearWalls()
+    gui:Destroy() -- Highlight ikut terhapus karena ada di dalam gui
+end)
+
+-- Loop latar belakang: scan ulang tiap "Scan ulang" detik (juga saat bot belum START),
+-- bersihkan highlight monster yang sudah mati, dan perbarui info scan.
+task.spawn(function()
+    while gui and gui.Parent do
+        local interval = math.max(num("scanint"), 1)
+        pcall(scan)
+
+        -- gambar ulang dinding jika radius / titik / ON-OFF berubah, atau folder hilang (kamera diganti)
+        local needWalls = wallsOn and (points[1] or points[2]) and (not wallFolder or not wallFolder.Parent)
+        if wallSignature() ~= wallSig or needWalls then
+            pcall(drawWalls)
+        end
+
+        for m, h in pairs(hlMap) do
+            local hum = m.Parent and m:FindFirstChildOfClass("Humanoid")
+            if not m.Parent or (hum and hum.Health <= 0) then
+                h:Destroy()
+                hlMap[m] = nil
+            end
+        end
+
+        if scanLabel then
+            local left = math.max(0, math.ceil(interval - (os.clock() - cache.t)))
+            local area = (points[1] or points[2]) and "" or " | area: semua"
+            scanLabel.Text = string.format("Scan: %d target(hijau) %d hindari(kuning) | %ds%s",
+                #cache.hounds, #cache.avoid, left, area)
+        end
+        task.wait(1)
+    end
+end)
+
+do
+    local dragging, startPos, startInput
+    title.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, startPos, startInput = true, main.Position, i.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
